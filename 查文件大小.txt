@@ -1,2 +1,10 @@
-在 C:\Users\30919> 下运行就行。""内输入目标路径
-.\check_folder_sizes.ps1 "D:\Project"
+用法（在任意目录运行，参数是目标路径，可多个）:
+
+  .\check_folder_sizes.ps1 "D:\Project"
+  .\check_folder_sizes.ps1 "D:\Project" "C:\Users"
+
+不带参数 = 扫描当前目录。
+
+排查 WSL / Docker 占空间（文件夹大小 + 最大的 15 个文件）:
+
+  .\check_folder_sizes.ps1 -TopFiles 15 "C:\Users\30919\AppData\Local\Docker" "C:\Users\30919\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu22.04LTS_79rhkp1fndgsc"
