@@ -1,3 +1,5 @@
 __pycache__/
 compact_result.txt
 compact_vdisk.txt
+folder_sizes.db
+ui_state.json
