@@ -1,9 +1,0 @@
-select vdisk file="C:\Users\30919\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu22.04LTS_79rhkp1fndgsc\LocalState\ext4.vhdx"
-attach vdisk readonly
-compact vdisk
-detach vdisk
-select vdisk file="C:\Users\30919\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
-attach vdisk readonly
-compact vdisk
-detach vdisk
-exit
