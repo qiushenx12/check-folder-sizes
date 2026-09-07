@@ -1,0 +1,2 @@
+在 C:\Users\30919> 下运行就行。""内输入目标路径
+.\check_folder_sizes.ps1 "D:\Project"
