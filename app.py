@@ -4,15 +4,19 @@ import ctypes
 import json
 import os
 import queue
+import re
+import shutil
 import sqlite3
+import stat
 import string
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
 from concurrent.futures import ThreadPoolExecutor
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 
 LOG_Q = queue.Queue()  # 日志队列：工作线程 put，主线程 _poll 取出显示（tk 非线程安全）
@@ -278,6 +282,524 @@ def start_dir(state):
     return d if isinstance(d, str) and os.path.isdir(d) else os.getcwd()
 
 
+# ==================== 专项清理：已知安全/可控占用项的规则注册表 ====================
+# 每条规则 = 一个 find()，返回待清理路径列表；路径在扫描时才从环境变量解析
+# （测试可把 LOCALAPPDATA/TEMP 指到夹具目录，不碰真实数据）
+
+def _temp_root():
+    return os.environ.get('TEMP') or os.environ.get('TMP') or ''
+
+
+def _lad():
+    return os.environ.get('LOCALAPPDATA') or ''
+
+
+_VS_JUNK = re.compile(r'[a-z0-9]{8}\.[a-z0-9]{3}$')
+
+
+def find_vsinstaller():
+    """%TEMP% 下 xxxxxxxx.xxx 格式且含 vs_installer.exe 的文件夹：
+    VS Installer 每次自我更新就解压一份完整副本，旧副本从不清理（实测两月攒 475 份 / 14 GB）"""
+    t = _temp_root()
+    if not t or not os.path.isdir(t):
+        return []
+    out = []
+    for e in os.scandir(t):
+        try:
+            if (e.is_dir(follow_symlinks=False) and _VS_JUNK.fullmatch(e.name)
+                    and os.path.isfile(os.path.join(e.path, 'vs_installer.exe'))):
+                out.append(e.path)
+        except OSError:
+            pass
+    return sorted(out)
+
+
+def find_temp_misc():
+    """%TEMP% 下除 VS Installer 残留外的其余所有项（被占用的删除时会自动跳过）"""
+    t = _temp_root()
+    if not t or not os.path.isdir(t):
+        return []
+    skip = {canon(p) for p in find_vsinstaller()}
+    out = []
+    for e in os.scandir(t):
+        try:
+            if canon(e.path) not in skip:
+                out.append(e.path)
+        except OSError:
+            pass
+    return sorted(out)
+
+
+def _contents(*parts):
+    """目录的内容项列表：保留目录本身，只清里面"""
+    base = os.path.join(_lad(), *parts) if _lad() else ''
+    if not base or not os.path.isdir(base):
+        return []
+    try:
+        return sorted(e.path for e in os.scandir(base))
+    except OSError:
+        return []
+
+
+def find_unity_cache():
+    return _contents('Unity', 'cache')
+
+
+def find_tuanjie_cache():
+    return _contents('Tuanjie', 'cache')
+
+
+def find_npm_cache():
+    return _contents('npm-cache')
+
+
+def find_crashdumps():
+    return _contents('CrashDumps')
+
+
+def find_pnpm_store():
+    # 只清 store 子目录：%LOCALAPPDATA%\pnpm 本身可能装着 pnpm 本体，不能动
+    return _contents('pnpm', 'store')
+
+
+def find_edge_sw():
+    base = os.path.join(_lad(), 'Microsoft', 'Edge', 'User Data', 'Default', 'Service Worker')
+    return [p for p in (os.path.join(base, s) for s in ('CacheStorage', 'ScriptStorage'))
+            if os.path.isdir(p)]
+
+
+class Rule:
+    """一条清理规则。proc 非空时：清理前检测到该进程在运行则整条跳过（文件被占用/防误伤）"""
+
+    def __init__(self, rid, name, risk, desc, find, default, proc=None):
+        self.id, self.name, self.risk, self.desc = rid, name, risk, desc
+        self.find, self.default, self.proc = find, default, proc
+
+
+RULES = [
+    Rule('temp_vsinstaller', 'VS Installer 更新残留', '安全',
+         'VS 安装器每次自我更新解压的副本（随机名文件夹），从不自动清理', find_vsinstaller, True),
+    Rule('temp_misc', 'Temp 其他临时文件', '注意',
+         '其余临时文件；被程序占用的会自动跳过，建议先关闭正在安装/更新的程序', find_temp_misc, False),
+    Rule('unity_cache', 'Unity Hub 下载缓存', '安全',
+         '编辑器安装包下载缓存，删除不影响已安装的编辑器', find_unity_cache, True),
+    Rule('tuanjie_cache', '团结引擎 Hub 下载缓存', '安全',
+         '同上（Unity 中国版），删除不影响已安装的编辑器', find_tuanjie_cache, True),
+    Rule('npm_cache', 'npm 缓存', '安全', 'npm 下载缓存，之后安装包会重新下载', find_npm_cache, True),
+    Rule('crashdumps', '程序崩溃转储', '安全', '软件崩溃时留下的 .dmp 调试文件', find_crashdumps, True),
+    Rule('pnpm_store', 'pnpm 存储', '注意',
+         'pnpm 全局包存储；删除后首次安装依赖会重新下载（不碰 pnpm 本体）', find_pnpm_store, False),
+    Rule('edge_sw', 'Edge 网站离线缓存', '注意',
+         'Service Worker 缓存的网站离线数据；需先完全关闭 Edge，部分 PWA 离线数据会丢',
+         find_edge_sw, False, proc='msedge.exe'),
+]
+
+
+def proc_running(image):
+    """按映像名检测进程是否在运行"""
+    if sys.platform != 'win32':
+        return False
+    try:
+        r = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq {image}', '/NH'],
+                           capture_output=True, text=True, timeout=15,
+                           creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return image.lower() in r.stdout.lower()
+    except Exception:
+        return False
+
+
+# ---- 删除：默认移入回收站（可恢复）；取消勾选则永久删除 ----
+_FO_DELETE = 0x0003
+_FOF_SILENT = 0x0004
+_FOF_NOCONFIRMATION = 0x0010
+_FOF_ALLOWUNDO = 0x0040
+_FOF_NOERRORUI = 0x0400
+_FOF_WANTNUKEWARNING = 0x4000  # 超出回收站容量时报错返回，而不是静默降级成永久删除
+
+
+class _SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [('hwnd', ctypes.c_void_p), ('wFunc', ctypes.c_uint),
+                ('pFrom', ctypes.c_wchar_p), ('pTo', ctypes.c_wchar_p),
+                ('fFlags', ctypes.c_ushort), ('fAnyOperationsAborted', ctypes.c_int),
+                ('hNameMappings', ctypes.c_void_p), ('lpszProgressTitle', ctypes.c_wchar_p)]
+
+
+def _recycle_call(paths):
+    """一批路径一次 API 调用（pFrom 是多字符串：\\0 分隔、字符串结尾符再补一个 \\0）。返回 0 成功"""
+    buf = '\0'.join(os.path.abspath(p) for p in paths) + '\0'
+    op = _SHFILEOPSTRUCTW()
+    op.wFunc = _FO_DELETE
+    op.pFrom = buf
+    op.fFlags = (_FOF_ALLOWUNDO | _FOF_NOCONFIRMATION | _FOF_SILENT
+                 | _FOF_NOERRORUI | _FOF_WANTNUKEWARNING)
+    return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+
+
+def recycle_paths(paths):
+    """移入回收站：分块批量执行（每块一次 API）；块失败时逐项重试定位问题项。
+    返回 (成功列表, 失败列表)。失败项原样保留，绝不悄悄降级成永久删除"""
+    ok, failed = [], []
+    paths = list(paths)
+    for i in range(0, len(paths), 200):
+        chunk = paths[i:i + 200]
+        try:
+            rc = _recycle_call(chunk)
+        except Exception:
+            rc = -1
+        if rc == 0:
+            ok.extend(chunk)
+        else:
+            for p in chunk:
+                try:
+                    rc = _recycle_call([p])
+                except Exception:
+                    rc = -1
+                (ok if rc == 0 else failed).append(p)
+    # API 报 0 但个别项实际还在（少见），按还在算失败
+    gone = [p for p in ok if not os.path.exists(p)]
+    return gone, failed + [p for p in ok if os.path.exists(p)]
+
+
+def _perm_delete(path):
+    """永久删除单个路径；只读文件（如 git packfile）先去只读属性再删"""
+    if os.path.isdir(path) and not os.path.islink(path):
+        def onexc(func, p, _exc):
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        shutil.rmtree(path, onexc=onexc)
+    else:
+        os.remove(path)
+
+
+def disk_free_text():
+    d = os.environ.get('SystemDrive', 'C:') + '\\'
+    try:
+        return f'{d[:2]} 盘剩余 {fmt_size(shutil.disk_usage(d).free)}'
+    except OSError:
+        return ''
+
+
+class CleanupTab(ttk.Frame):
+    """「专项清理」分页：规则化专项扫描 + 汇总统计面板 + 一键清理（过程可视）。
+    线程模型与主界面一致：工作线程只碰 queue，主线程 poll 刷新（tk 非线程安全）"""
+
+    def __init__(self, master, state, scale=1.0):
+        super().__init__(master)
+        self.q = queue.Queue()   # 本分页的事件队列（由 App._poll 驱动 poll()）
+        self.results = {}        # rule_id -> [(path, size)]，扫描填充
+        self.checked = {}        # rule_id -> bool
+        self.busy = False        # 扫描或清理进行中
+        self._last_clean = ''    # 上次清理结果摘要（显示在汇总第二行）
+        self.confirm = lambda text: messagebox.askyesno('确认清理', text, parent=self)
+
+        st = state.get('cleanup') if isinstance(state.get('cleanup'), dict) else {}
+        saved_sel = st.get('sel') if isinstance(st.get('sel'), list) else None
+        for r in RULES:  # 有记忆按记忆，没有按规则默认（安全项勾选）
+            self.checked[r.id] = (r.id in saved_sel) if saved_sel is not None else r.default
+        self.recycle_var = tk.BooleanVar(value=bool(st.get('recycle', True)))
+
+        # 工具栏
+        bar = ttk.Frame(self)
+        bar.pack(fill='x', padx=8, pady=(8, 4))
+        self.scan_btn = ttk.Button(bar, text='开始扫描', command=self.start_scan)
+        self.scan_btn.pack(side='left')
+        ttk.Button(bar, text='勾选安全项', command=self.check_safe).pack(side='left', padx=(6, 0))
+        self.clean_btn = ttk.Button(bar, text='一键清理', command=self.start_clean,
+                                    state='disabled')
+        self.clean_btn.pack(side='left', padx=(6, 0))
+        ttk.Checkbutton(bar, text='移入回收站（可恢复）',
+                        variable=self.recycle_var).pack(side='left', padx=(12, 0))
+
+        # 汇总统计面板
+        panel = ttk.LabelFrame(self, text='汇总')
+        panel.pack(fill='x', padx=8, pady=(0, 4))
+        self.sum_var1 = tk.StringVar(value='尚未扫描 —— 点「开始扫描」查找可清理项')
+        self.sum_var2 = tk.StringVar(value=disk_free_text())
+        ttk.Label(panel, textvariable=self.sum_var1, anchor='w').pack(fill='x', padx=6, pady=(3, 0))
+        ttk.Label(panel, textvariable=self.sum_var2, anchor='w').pack(fill='x', padx=6, pady=(0, 3))
+
+        # 清理过程：进度条 + 当前动作（pack 顺序决定布局：先底栏后中间展开区）
+        prog = ttk.Frame(self)
+        prog.pack(side='bottom', fill='x', padx=8, pady=(4, 8))
+        self.prog_var = tk.StringVar(value='')
+        ttk.Label(prog, textvariable=self.prog_var, anchor='w').pack(fill='x')
+        self.prog = ttk.Progressbar(prog, maximum=100)
+        self.prog.pack(fill='x', pady=(2, 0))
+        log_box = ttk.LabelFrame(self, text='清理过程')
+        log_box.pack(side='bottom', fill='both', padx=8, pady=(0, 4))
+        self.log_view = tk.Text(log_box, height=9, state='disabled', wrap='word',
+                                font=('Consolas', 9))
+        lsb = ttk.Scrollbar(log_box, orient='vertical', command=self.log_view.yview)
+        self.log_view.config(yscrollcommand=lsb.set)
+        self.log_view.pack(side='left', fill='both', expand=True)
+        lsb.pack(side='right', fill='y')
+
+        # 规则列表：首列模拟勾选框（点单元格切换 ☑/☐），双击行查看命中的具体路径
+        cols = ('sel', 'name', 'size', 'count', 'risk', 'desc')
+        tree_box = ttk.Frame(self)
+        tree_box.pack(side='top', fill='both', expand=True, padx=8, pady=(0, 4))
+        self.rules = ttk.Treeview(tree_box, columns=cols, show='headings', height=8)
+        for col, text, w, anchor in (('sel', '选', 36, 'center'),
+                                     ('name', '规则', 170, 'w'),
+                                     ('size', '大小', 100, 'e'),
+                                     ('count', '目标数', 60, 'e'),
+                                     ('risk', '风险', 50, 'center'),
+                                     ('desc', '说明', 380, 'w')):
+            self.rules.heading(col, text=text)
+            self.rules.column(col, width=int(w * scale), anchor=anchor,
+                              stretch=(col == 'desc'))
+        for r in RULES:
+            self.rules.insert('', 'end', iid=r.id,
+                              values=(self._sel_mark(r.id), r.name, '—', '—', r.risk,
+                                      r.desc))
+        rsb = ttk.Scrollbar(tree_box, orient='vertical', command=self.rules.yview)
+        self.rules.config(yscrollcommand=rsb.set)
+        self.rules.pack(side='left', fill='both', expand=True)
+        rsb.pack(side='right', fill='y')
+        self.rules.bind('<Button-1>', self._on_rule_click)
+        self.rules.bind('<Double-1>', self._on_rule_dblclick)
+
+    # ---- 勾选状态 ----
+    def _sel_mark(self, rid):
+        return '☑' if self.checked.get(rid) else '☐'
+
+    def set_checked(self, ids):
+        ids = set(ids)
+        for r in RULES:
+            self.checked[r.id] = r.id in ids
+            self.rules.item(r.id, values=(self._sel_mark(r.id), r.name,
+                                          *self.rules.item(r.id)['values'][2:]))
+        self._update_summary()
+        self._refresh_clean_btn()
+
+    def check_safe(self):
+        self.set_checked(r.id for r in RULES if r.risk == '安全')
+
+    def _on_rule_click(self, e):
+        if self.busy:
+            return
+        row = self.rules.identify_row(e.y)
+        if row and self.rules.identify_column(e.x) == '#1':
+            self.checked[row] = not self.checked.get(row, False)
+            vals = self.rules.item(row)['values']
+            self.rules.item(row, values=(self._sel_mark(row), *vals[1:]))
+            self._update_summary()
+            self._refresh_clean_btn()
+
+    def _on_rule_dblclick(self, e):
+        row = self.rules.identify_row(e.y)
+        items = self.results.get(row or '')
+        if not items:
+            return
+        rule = next(r for r in RULES if r.id == row)
+        top = tk.Toplevel(self)
+        top.title(f'{rule.name} —— 命中 {len(items)} 项')
+        txt = tk.Text(top, wrap='none', font=('Consolas', 9))
+        sb = ttk.Scrollbar(top, orient='vertical', command=txt.yview)
+        txt.config(yscrollcommand=sb.set)
+        txt.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        for p, s in items:
+            txt.insert('end', f'{fmt_size(s):>10}  {safe(p)}\n')
+        txt.config(state='disabled')
+
+    # ---- 汇总面板 ----
+    def _update_summary(self):
+        if not self.results:
+            return
+        total = sum(s for items in self.results.values() for _, s in items)
+        n = sum(len(items) for items in self.results.values())
+        hit = sum(1 for items in self.results.values() if items)
+        sel = sum(s for r in RULES if self.checked.get(r.id)
+                  for _, s in self.results.get(r.id, []))
+        self.sum_var1.set(f'可清理 {fmt_size(total)}（{hit}/{len(RULES)} 项规则命中，'
+                          f'共 {n} 个目标）｜已勾选 {fmt_size(sel)}')
+
+    def _refresh_var2(self):
+        parts = [disk_free_text(), self._last_clean]
+        self.sum_var2.set('｜'.join(p for p in parts if p))
+
+    def _refresh_clean_btn(self):
+        ready = bool(self.results) and any(
+            self.checked.get(r.id) and self.results.get(r.id) for r in RULES)
+        self.clean_btn.config(state='normal' if ready and not self.busy else 'disabled')
+
+    # ---- 扫描 ----
+    def start_scan(self):
+        if self.busy:
+            return
+        self.busy = True
+        self.results = {}
+        self.scan_btn.config(state='disabled')
+        self.clean_btn.config(state='disabled')
+        self.sum_var1.set('扫描中…')
+        for r in RULES:
+            vals = self.rules.item(r.id)['values']
+            self.rules.item(r.id, values=(vals[0], r.name, '…', '…', r.risk, r.desc))
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        for r in RULES:
+            t0 = time.time()
+            try:
+                paths = r.find()
+            except Exception as e:
+                log(f'专项扫描规则「{r.name}」查找失败: {e!r}')
+                paths = []
+            items = []
+            for p in paths:
+                try:
+                    size = (dir_size(p) if os.path.isdir(p) and not os.path.islink(p)
+                            else os.path.getsize(p))
+                except OSError:
+                    size = 0
+                items.append((p, size))
+            items.sort(key=lambda x: x[1], reverse=True)
+            hint = ''
+            if items and r.proc and proc_running(r.proc):
+                hint = f'（检测到 {r.proc} 运行中，清理时将跳过）'
+            log(f'专项扫描: {r.name} 命中 {len(items)} 项 '
+                f'{fmt_size(sum(s for _, s in items))}，耗时 {time.time() - t0:.1f}s')
+            self.q.put(('scan_rule', r.id, items, hint))
+        self.q.put(('scan_done',))
+
+    # ---- 清理 ----
+    def start_clean(self):
+        if self.busy:
+            return
+        selected = [r for r in RULES if self.checked.get(r.id) and self.results.get(r.id)]
+        if not selected:
+            return
+        total = sum(s for r in selected for _, s in self.results[r.id])
+        n = sum(len(self.results[r.id]) for r in selected)
+        mode = '移入回收站' if self.recycle_var.get() else '永久删除'
+        lines = '\n'.join(f'· {r.name}（{fmt_size(sum(s for _, s in self.results[r.id]))}）'
+                          for r in selected)
+        if not self.confirm(f'将以【{mode}】方式清理以下 {len(selected)} 项规则'
+                            f'（共 {n} 个目标，{fmt_size(total)}）：\n\n{lines}\n\n继续？'):
+            return
+        self.busy = True
+        self.scan_btn.config(state='disabled')
+        self.clean_btn.config(state='disabled')
+        self.prog.config(maximum=max(n, 1), value=0)
+        threading.Thread(target=self._clean_worker,
+                         args=(selected, self.recycle_var.get()), daemon=True).start()
+
+    def _clean_worker(self, selected, recycle):
+        freed, ok_n, skip_n, fail_n = 0, 0, 0, 0
+        total = sum(len(self.results[r.id]) for r in selected)
+        done = 0
+        for r in selected:
+            items = self.results.get(r.id, [])
+            self.q.put(('clean_log', f'—— {r.name}（{len(items)} 项，{mode_str(recycle)}）——'))
+            if r.proc and proc_running(r.proc):
+                self.q.put(('clean_log',
+                            f'⚠ 检测到 {r.proc} 正在运行，整条跳过（请先关闭再清理）'))
+                skip_n += len(items)
+                done += len(items)
+                self.q.put(('clean_step', done, total, r.name))
+                continue
+            if recycle:
+                sizes = {canon(p): s for p, s in items}
+                stale = [p for p, _ in items
+                         if not os.path.exists(p) and not os.path.islink(p)]
+                stale_set = set(stale)
+                if stale:  # 扫描后被别的东西删掉了，算跳过而非失败
+                    skip_n += len(stale)
+                    for p in stale:
+                        self.q.put(('clean_log', f'⊘ 已不存在: {safe(p)}'))
+                ok, failed = recycle_paths([p for p, _ in items if p not in stale_set])
+                ok_n += len(ok)
+                freed += sum(sizes.get(canon(p), 0) for p in ok)
+                fail_n += len(failed)
+                if ok:
+                    self.q.put(('clean_log',
+                                f'✓ 已移入回收站 {len(ok)} 项'
+                                f'（{fmt_size(sum(sizes.get(canon(p), 0) for p in ok))}）'))
+                for p in failed:
+                    self.q.put(('clean_log', f'✗ 回收站收不下或删除失败: {safe(p)}'))
+                done += len(items)
+                self.q.put(('clean_step', done, total, r.name))
+            else:
+                for p, size in items:
+                    if not os.path.exists(p) and not os.path.islink(p):
+                        skip_n += 1
+                        self.q.put(('clean_log', f'⊘ 已不存在: {safe(p)}'))
+                    else:
+                        try:
+                            _perm_delete(p)
+                            ok_n += 1
+                            freed += size
+                            self.q.put(('clean_log', f'✓ 已删除: {safe(p)}'))
+                        except OSError as e:
+                            fail_n += 1
+                            self.q.put(('clean_log',
+                                        f'✗ 删除失败: {safe(p)}（{e.strerror or e}）'))
+                    done += 1
+                    self.q.put(('clean_step', done, total, r.name))
+        log(f'专项清理完成: 释放 {fmt_size(freed)}，成功 {ok_n}，跳过 {skip_n}，失败 {fail_n}')
+        self.q.put(('clean_done', freed, ok_n, skip_n, fail_n))
+
+    # ---- 事件处理（主线程 poll） ----
+    def poll(self):
+        try:
+            while True:
+                self._handle(*self.q.get_nowait())
+        except queue.Empty:
+            pass
+
+    def _handle(self, kind, *args):
+        if kind == 'scan_rule':
+            rid, items, hint = args
+            self.results[rid] = items
+            rule = next(r for r in RULES if r.id == rid)
+            self.rules.item(rid, values=(self._sel_mark(rid), rule.name,
+                                         fmt_size(sum(s for _, s in items)),
+                                         len(items), rule.risk, rule.desc + hint))
+            self._update_summary()
+        elif kind == 'scan_done':
+            self.busy = False
+            self.scan_btn.config(state='normal')
+            self._update_summary()
+            self._refresh_var2()
+            self._refresh_clean_btn()
+            n = sum(len(v) for v in self.results.values())
+            self.prog_var.set(f'扫描完成：{n} 个目标' if n else '扫描完成：没有发现可清理项')
+        elif kind == 'clean_log':
+            self._append(args[0])
+        elif kind == 'clean_step':
+            done, total, name = args
+            self.prog.config(value=done)
+            self.prog_var.set(f'清理中：{name}（{done}/{total}）')
+        elif kind == 'clean_done':
+            freed, ok_n, skip_n, fail_n = args
+            self.busy = False
+            self.scan_btn.config(state='normal')
+            self._last_clean = (f'本次释放 {fmt_size(freed)}'
+                                f'（成功 {ok_n}，跳过 {skip_n}，失败 {fail_n}）')
+            self.prog_var.set('清理完成，正在重新扫描…')
+            self._append(f'════ 清理完成：释放 {fmt_size(freed)}，'
+                         f'成功 {ok_n} 项，跳过 {skip_n} 项，失败 {fail_n} 项 ════')
+            self.start_scan()  # 重新扫描：列表和汇总数字刷新为真实剩余
+
+    def _append(self, line):
+        self.log_view.config(state='normal')
+        self.log_view.insert('end', safe(line) + '\n')
+        n = int(self.log_view.index('end-1c').split('.')[0])
+        if n > 2000:
+            self.log_view.delete('1.0', f'{n - 2000}.0')
+        self.log_view.see('end')
+        self.log_view.config(state='disabled')
+
+    def ui_state(self):
+        return {'sel': [r.id for r in RULES if self.checked.get(r.id)],
+                'recycle': bool(self.recycle_var.get())}
+
+
+def mode_str(recycle):
+    return '移入回收站' if recycle else '永久删除'
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -293,8 +815,18 @@ class App(tk.Tk):
         self.current = ''     # 左侧当前选中路径
         self.store = Store()  # 必须在 navigate 前建好（set_current 会查库）
 
+        s = self._eff_scale()  # DPI 缩放比：分隔条宽、列宽都按它放大，不同缩放下视觉一致
+
+        # 分页：磁盘分析（原有目录树浏览）+ 专项清理（已知安全项扫描/一键清理）
+        self.nb = ttk.Notebook(self)
+        tab1 = ttk.Frame(self.nb)
+        self.nb.add(tab1, text='磁盘分析')
+        self.cleanup_tab = CleanupTab(self.nb, self.state, s)
+        self.nb.add(self.cleanup_tab, text='专项清理')
+        self.nb.pack(fill='both', expand=True)
+
         # 顶栏：路径输入框 + 转到按钮
-        top = ttk.Frame(self)
+        top = ttk.Frame(tab1)
         top.pack(fill='x', padx=8, pady=6)
         self.path_var = tk.StringVar()
         entry = ttk.Entry(top, textvariable=self.path_var)
@@ -303,11 +835,10 @@ class App(tk.Tk):
         ttk.Button(top, text='转到',
                    command=lambda: self.navigate(self.path_var.get())).pack(side='left', padx=(6, 0))
 
-        s = self._eff_scale()  # DPI 缩放比：分隔条宽、列宽都按它放大，不同缩放下视觉一致
         # 左右布局不用 ttk.PanedWindow：原生 sash 只有 ~4px 太细，且 Windows vista 主题
         # 忽略 sashwidth 无法加粗。改用自绘分隔条：10 逻辑像素宽条 + 中间 1px 细线提示可拖动，
         # 悬停/按下时加深，光标变为双向箭头。
-        self.paned = tk.Frame(self)
+        self.paned = tk.Frame(tab1)
         self.paned.pack(fill='both', expand=True, padx=8, pady=(0, 8))
 
         # 左侧：目录树（懒加载，双击展开即打开）+ 底部分析按钮
@@ -404,6 +935,9 @@ class App(tk.Tk):
 
         self.protocol('WM_DELETE_WINDOW', self._close)  # 关窗时存界面状态
         self.after(150, self._restore_sash)  # 窗口拿到实际尺寸后恢复分隔条位置
+        tab_i = self.state.get('tab')  # 恢复上次所在分页
+        if isinstance(tab_i, int) and 0 <= tab_i < self.nb.index('end'):
+            self.nb.select(tab_i)
 
         self.navigate(start_dir(self.state))  # 恢复上次定位的目录（树逐级展开+选中+滚动可见）
         self.q = queue.Queue()  # 扫描线程 → 主线程
@@ -438,6 +972,8 @@ class App(tk.Tk):
                            'w': round(self.winfo_width() / s), 'h': round(self.winfo_height() / s)}}
         if self.current and os.path.isdir(self.current):
             st['dir'] = self.current  # 上次定位的目录，下次启动左侧树直接展开选中
+        st['tab'] = self.nb.index(self.nb.select())  # 上次所在分页
+        st['cleanup'] = self.cleanup_tab.ui_state()  # 清理页勾选状态 + 回收站开关
         try:
             st['sash'] = round(self.left_frame.winfo_width() /
                                max(self.paned.winfo_width() - self.sash.winfo_width(), 1), 3)
@@ -607,6 +1143,7 @@ class App(tk.Tk):
 
     def _poll(self):
         self._sync_selection()
+        self.cleanup_tab.poll()  # 专项清理页的事件队列（扫描/清理进度）
         try:
             while True:
                 self._fill(*self.q.get_nowait())

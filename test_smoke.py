@@ -148,5 +148,126 @@ assert app_mod.start_dir(st) == here
 assert app_mod.start_dir({'dir': 'Z:\\no_such_dir_xyz'}) == os.getcwd()
 assert app_mod.start_dir({}) == os.getcwd()
 
+# ============ 专项清理分页 ============
+# 夹具：临时目录冒充 LOCALAPPDATA / TEMP（规则在扫描时才读环境变量，不碰真实数据）
+tab = app.cleanup_tab
+assert app.nb.index('end') == 2, '应有「磁盘分析」「专项清理」两个分页'
+assert app.nb.tab(1, 'text') == '专项清理'
+
+fix = tempfile.mkdtemp(prefix='cfs_fix_')
+lad = os.path.join(fix, 'LAD')
+tmpd = os.path.join(fix, 'Temp')
+vs_junk = os.path.join(tmpd, 'abcd1234.efg')  # VS Installer 残留特征：随机名 + vs_installer.exe
+os.makedirs(vs_junk)
+with open(os.path.join(vs_junk, 'vs_installer.exe'), 'w') as f:
+    f.write('v' * 100)
+with open(os.path.join(tmpd, 'leftover.tmp'), 'w') as f:
+    f.write('t' * 50)
+pkg = os.path.join(lad, 'Unity', 'cache', 'packages')
+os.makedirs(pkg)
+with open(os.path.join(pkg, 'editor.zip'), 'w') as f:
+    f.write('u' * 200)
+os.makedirs(os.path.join(lad, 'CrashDumps'))
+with open(os.path.join(lad, 'CrashDumps', 'app.dmp'), 'w') as f:
+    f.write('d' * 80)
+sw = os.path.join(lad, 'Microsoft', 'Edge', 'User Data', 'Default',
+                  'Service Worker', 'CacheStorage')
+os.makedirs(sw)
+with open(os.path.join(sw, 'cache.bin'), 'w') as f:
+    f.write('e' * 60)
+
+old_lad, old_temp = os.environ.get('LOCALAPPDATA'), os.environ.get('TEMP')
+os.environ['LOCALAPPDATA'], os.environ['TEMP'] = lad, tmpd
+tab.confirm = lambda *a, **k: True  # 确认框不真弹（会阻塞事件循环）
+try:
+    # 专项扫描：各规则命中夹具内容，大小正确
+    tab.start_scan()
+    assert pump_until(lambda: not tab.busy, rounds=400), '专项扫描未结束'
+    res = {rid: dict(items) for rid, items in tab.results.items()}
+    assert res['temp_vsinstaller'] == {vs_junk: 100}, res['temp_vsinstaller']
+    assert res['temp_misc'] == {os.path.join(tmpd, 'leftover.tmp'): 50}, res['temp_misc']
+    assert res['unity_cache'] == {pkg: 200}, res['unity_cache']
+    assert res['crashdumps'] == {os.path.join(lad, 'CrashDumps', 'app.dmp'): 80}
+    assert res['edge_sw'] == {sw: 60}, res['edge_sw']
+    assert not res['npm_cache'] and not res['tuanjie_cache'] and not res['pnpm_store']
+    assert '可清理' in tab.sum_var1.get(), tab.sum_var1.get()
+
+    # 永久删除模式：安全项被删，未勾选项保留；汇总显示释放量
+    tab.recycle_var.set(False)
+    tab.check_safe()  # temp_vsinstaller/unity/tuanjie/npm/crashdumps；不含 temp_misc/edge/pnpm
+    tab.start_clean()
+    assert pump_until(lambda: not tab.busy, rounds=400), '清理未结束'
+    assert not os.path.exists(vs_junk), 'VS Installer 残留应被删除'
+    assert not os.path.exists(pkg), 'Unity 缓存内容应被删除'
+    assert os.path.isdir(os.path.join(lad, 'Unity', 'cache')), '缓存目录本身应保留'
+    assert not os.path.exists(os.path.join(lad, 'CrashDumps', 'app.dmp'))
+    assert os.path.exists(os.path.join(tmpd, 'leftover.tmp')), 'temp_misc 未勾选不应删'
+    assert os.path.exists(sw), 'edge_sw 未勾选不应删'
+    assert '本次释放' in tab.sum_var2.get(), tab.sum_var2.get()
+
+    # 进程占用保护：Edge 运行中时 edge_sw 整条跳过
+    orig_proc = app_mod.proc_running
+    app_mod.proc_running = lambda img: True
+    try:
+        tab.set_checked(['edge_sw'])
+        tab.start_clean()
+        assert pump_until(lambda: not tab.busy, rounds=400)
+        assert os.path.exists(sw), 'Edge 运行中不应删除其缓存'
+        assert '跳过 1' in tab.sum_var2.get(), tab.sum_var2.get()
+    finally:
+        app_mod.proc_running = orig_proc
+
+    # 删除失败计入失败数，文件保留（proc_running 强制为 False，与真实 Edge 是否运行无关）
+    orig_pd = app_mod._perm_delete
+    def flaky(p):
+        if p.endswith('CacheStorage'):
+            raise PermissionError('被占用')
+        return orig_pd(p)
+    app_mod._perm_delete = flaky
+    app_mod.proc_running = lambda img: False
+    try:
+        tab.start_clean()
+        assert pump_until(lambda: not tab.busy, rounds=400)
+        assert os.path.exists(sw), '删除失败时文件应保留'
+        assert '失败 1' in tab.sum_var2.get(), tab.sum_var2.get()
+    finally:
+        app_mod._perm_delete = orig_pd
+        app_mod.proc_running = orig_proc
+
+    # 回收站模式：走 recycle_paths 通道（测试里 mock 成真实删除，不碰真回收站）
+    calls = []
+    def fake_recycle(paths):
+        calls.append(len(paths))
+        for p in paths:
+            app_mod._perm_delete(p)
+        return list(paths), []
+    orig_rec = app_mod.recycle_paths
+    app_mod.recycle_paths = fake_recycle
+    app_mod.proc_running = lambda img: False
+    try:
+        tab.recycle_var.set(True)
+        tab.set_checked(['edge_sw'])
+        tab.start_clean()
+        assert pump_until(lambda: not tab.busy, rounds=400)
+        assert calls, '回收站模式应调用 recycle_paths'
+        assert not os.path.exists(sw), '回收站模式（mock 为真删）后文件应不存在'
+    finally:
+        app_mod.recycle_paths = orig_rec
+        app_mod.proc_running = orig_proc
+finally:
+    if old_lad is None:
+        os.environ.pop('LOCALAPPDATA', None)
+    else:
+        os.environ['LOCALAPPDATA'] = old_lad
+    os.environ['TEMP'] = old_temp
+    import shutil as _sh
+    _sh.rmtree(fix, ignore_errors=True)
+
+# 清理页状态记忆：勾选集合 + 回收站开关 + 上次分页 都进 ui_state.json
+app._save_ui_state()
+st2 = json.load(open(app_mod.UI_STATE_PATH, encoding='utf-8'))
+assert 'cleanup' in st2 and 'sel' in st2['cleanup'] and 'recycle' in st2['cleanup'], st2
+assert st2['tab'] == 0, st2
+
 print('OK —', len(app.list.get_children()), '行')
 app.destroy()
